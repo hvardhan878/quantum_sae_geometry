@@ -3,8 +3,19 @@ intervention_test.py — quick sanity check for the intervention experiment.
 
 Run after the layer sweep completes:
 
+    # default: Gemma-2-2B
     python intervention_test.py --layer 0
     python intervention_test.py --layer 12 --top_n 10
+
+    # 9B run
+    python intervention_test.py --model gemma-2-9b-it --layer 0
+    python intervention_test.py --model gemma-2-9b-it --layer 41
+
+    # different results dir
+    python intervention_test.py --results_dir /storage/results --model gemma-2-9b-it --layer 0
+
+    # fully explicit (overrides --model/--layer/--results_dir composition)
+    python intervention_test.py --model_dir /storage/results/gemma-2-9b-it-layer-0
 
 What this does
 --------------
@@ -15,10 +26,11 @@ What this does
 4. Runs a one-sided Mann-Whitney U test asking whether the top-quantum
    clusters have a *larger* unconstrained-vs-constrained FVU gap than the
    bottom-quantum clusters.
-5. Saves a two-panel diagnostic plot to results/<model>/intervention_test.png.
+5. Saves a two-panel diagnostic plot to <model_dir>/intervention_test.png.
 """
 import argparse
 import os
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,8 +41,18 @@ from scipy.optimize import nnls
 from scipy.stats import mannwhitneyu, spearmanr
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--layer", type=int, default=0)
-parser.add_argument("--results_dir", type=str, default="./results")
+parser.add_argument("--layer", type=int, default=0,
+                    help="layer number (composes with --model into "
+                         "<results_dir>/<model>-layer-<layer>)")
+parser.add_argument("--model", type=str, default="gemma-2-2b-it",
+                    help="model family prefix, e.g. 'gemma-2-2b-it', "
+                         "'gemma-2-9b-it', 'llama-3.1-8b'")
+parser.add_argument("--results_dir", type=str, default="./results",
+                    help="parent results directory containing per-model folders")
+parser.add_argument("--model_dir", type=str, default=None,
+                    help="optional: full path to a single model directory; "
+                         "if given, overrides --model/--layer/--results_dir "
+                         "composition")
 parser.add_argument("--top_n", type=int, default=10)
 parser.add_argument("--seed", type=int, default=0,
                     help="seed for the random simplex initialisation")
@@ -38,8 +60,17 @@ args = parser.parse_args()
 
 np.random.seed(args.seed)
 
-model_name = f"gemma-2-2b-it-layer-{args.layer}"
-base = os.path.join(args.results_dir, model_name)
+# Resolve the per-layer results directory.
+if args.model_dir is not None:
+    base = args.model_dir
+    model_name = os.path.basename(os.path.normpath(base))
+else:
+    model_name = f"{args.model}-layer-{args.layer}"
+    base = os.path.join(args.results_dir, model_name)
+
+if not os.path.isdir(base):
+    print(f"[error] model directory does not exist: {base}", file=sys.stderr)
+    sys.exit(1)
 
 print(f"\nLoading data from {base} ...")
 activations  = torch.load(os.path.join(base, "activations.pt"), weights_only=False)
@@ -194,7 +225,7 @@ r_val, r_p = spearmanr(
 
 print(f"""
 ==============================================================
-  INTERVENTION SANITY CHECK — layer {args.layer}
+  INTERVENTION SANITY CHECK — {model_name}
 ==============================================================
   Quantum clusters   (n={top_n}): mean gap = {quantum_gaps.mean():.4f}
   Classical clusters (n={top_n}): mean gap = {classical_gaps.mean():.4f}
@@ -222,7 +253,7 @@ ax.set_xticks([1, 2])
 ax.set_xticklabels(["Quantum", "Classical"])
 ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
 ax.set_ylabel("FVU Gap (classical − unconstrained) / classical")
-ax.set_title(f"Layer {args.layer} — FVU Gap by Cluster Type")
+ax.set_title(f"{model_name} — FVU Gap by Cluster Type")
 for g in quantum_gaps:
     ax.scatter(1 + np.random.uniform(-0.05, 0.05), g, color="red",  alpha=0.6, s=40)
 for g in classical_gaps:
@@ -241,7 +272,7 @@ ax.scatter(all_qness, all_gaps, c=colors, alpha=0.7, s=60)
 ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
 ax.set_xlabel("Quantum-ness Score")
 ax.set_ylabel("FVU Gap")
-ax.set_title(f"Layer {args.layer} — Quantum-ness vs FVU Gap\n"
+ax.set_title(f"{model_name} — Quantum-ness vs FVU Gap\n"
              f"Spearman r={r_val:.3f} p={r_p:.4f}")
 
 plt.tight_layout()
