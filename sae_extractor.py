@@ -27,6 +27,86 @@ from config import (
 
 
 # ---------------------------------------------------------------------------
+# SAE ID resolution — handles version differences in SAELens release catalogs
+# ---------------------------------------------------------------------------
+
+def _resolve_sae_id(release: str, configured_id: str, target_layer: int) -> str:
+    """
+    Return the best matching SAE ID for the given release.
+
+    1. Try the configured ID first (fast path, no network).
+    2. If it's not in the catalog, query SAELens for all IDs in the release
+       and pick the one that best matches target_layer + configured width/l0.
+    3. Print a clear diff so the user can update config.py.
+    """
+    # Attempt to get the catalog without triggering a download
+    catalog = _get_saelens_catalog(release)
+    if catalog is None:
+        # Catalog unavailable — pass the configured ID through and let SAELens
+        # raise a descriptive error if it is wrong
+        return configured_id
+
+    if configured_id in catalog:
+        return configured_id
+
+    # ---- Configured ID not in catalog — auto-select best match ----
+    layer_prefix = f"layer_{target_layer}/"
+    layer_ids = [i for i in catalog if i.startswith(layer_prefix)]
+
+    if not layer_ids:
+        # No IDs for this layer at all — print full catalog and raise
+        print(f"[sae_extractor] ERROR: No SAE IDs found for layer {target_layer} "
+              f"in release '{release}'.")
+        print(f"[sae_extractor] Full catalog ({len(catalog)} entries):")
+        for cid in sorted(catalog):
+            print(f"  {cid}")
+        raise ValueError(
+            f"Release '{release}' has no SAEs for layer {target_layer}. "
+            f"Run `python list_saes.py {release}` to see what is available."
+        )
+
+    # Score by how closely each candidate matches the configured_id tokens
+    configured_tokens = set(configured_id.replace("/", "_").split("_"))
+
+    def _score(cid: str) -> int:
+        tokens = set(cid.replace("/", "_").split("_"))
+        return len(tokens & configured_tokens)
+
+    best = max(layer_ids, key=_score)
+    print(f"[sae_extractor] WARNING: SAE ID '{configured_id}' not found in release '{release}'.")
+    print(f"[sae_extractor] Auto-selected closest match: '{best}'")
+    print(f"[sae_extractor] To silence this warning update sae_id in config.py to: '{best}'")
+    print(f"[sae_extractor] All layer-{target_layer} options:")
+    for cid in sorted(layer_ids):
+        marker = "  >>> " if cid == best else "      "
+        print(f"{marker}{cid}")
+    return best
+
+
+def _get_saelens_catalog(release: str) -> list[str] | None:
+    """Return list of SAE IDs for `release`, or None if catalog is unavailable."""
+    for import_path in (
+        "sae_lens.toolkit.pretrained_saes_directory",
+        "sae_lens.pretrained_saes_directory",
+        "sae_lens",
+    ):
+        try:
+            mod = __import__(import_path, fromlist=["get_pretrained_saes_directory"])
+            fn = getattr(mod, "get_pretrained_saes_directory", None)
+            if fn is None:
+                continue
+            directory = fn()
+            if release not in directory:
+                return []
+            entry = directory[release]
+            saes_map = getattr(entry, "saes_map", None) or {}
+            return list(saes_map.keys())
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -103,11 +183,10 @@ def extract_activations(
     model.eval()
 
     # ---- Load SAE ----
-    print(f"[sae_extractor] Loading SAE {model_cfg['sae_release']} / {model_cfg['sae_id']} ...")
-    sae, cfg_dict, _ = SAE.from_pretrained(
-        release=model_cfg["sae_release"],
-        sae_id=model_cfg["sae_id"],
-    )
+    sae_release = model_cfg["sae_release"]
+    sae_id = _resolve_sae_id(sae_release, model_cfg["sae_id"], model_cfg["target_layer"])
+    print(f"[sae_extractor] Loading SAE {sae_release} / {sae_id} ...")
+    sae, cfg_dict, _ = SAE.from_pretrained(release=sae_release, sae_id=sae_id)
     sae = sae.to(device)
     sae.eval()
     # Probe the SAE's expected input dtype by looking at its decoder weight

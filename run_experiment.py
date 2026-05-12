@@ -206,10 +206,11 @@ def _save_decoder(model_cfg: dict, results_dir: str) -> None:
     clustering.py can use it without re-loading the full SAE.
     """
     from sae_lens import SAE
-    sae, _, _ = SAE.from_pretrained(
-        release=model_cfg["sae_release"],
-        sae_id=model_cfg["sae_id"],
+    from sae_extractor import _resolve_sae_id
+    sae_id = _resolve_sae_id(
+        model_cfg["sae_release"], model_cfg["sae_id"], model_cfg["target_layer"]
     )
+    sae, _, _ = SAE.from_pretrained(release=model_cfg["sae_release"], sae_id=sae_id)
     dec = sae.W_dec.detach().float()  # (n_features, d_model)
     decoder_path = os.path.join(results_dir, model_cfg["name"], "decoder.pt")
     torch.save(dec, decoder_path)
