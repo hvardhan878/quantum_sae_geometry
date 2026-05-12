@@ -147,7 +147,7 @@ def run_model(model_cfg: dict, args: argparse.Namespace) -> dict | None:
         geo_results = classify_all_clusters(
             model_cfg,
             clusters,
-            activations["feature_activations"],
+            activations,
             results_dir=results_dir,
         )
         from collections import Counter

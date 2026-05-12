@@ -87,6 +87,7 @@ def _make_synthetic_activations(seed: int = 0) -> dict:
             "feature_activations": torch.from_numpy(feat),
             "sae_reconstruction":  torch.from_numpy(recon),
             "residual":            torch.from_numpy(residual),
+            "last_hidden":         torch.from_numpy(hidden),
             "fvu_per_prompt":      torch.from_numpy(fvu),
         },
     }
@@ -142,7 +143,7 @@ def run_dry(results_dir: str) -> bool:
     geo = classify_all_clusters(
         fake_model_cfg,
         clusters,
-        synth["activations"]["feature_activations"],
+        synth["activations"],
         results_dir=results_dir,
         force_reclassify=True,
     )

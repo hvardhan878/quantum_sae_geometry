@@ -4,24 +4,36 @@ Geometry classifier — the core novel contribution.
 We test whether a cluster's activation trajectory across prompts requires
 going outside the classical probability simplex to be explained.
 
+What we operate on
+------------------
+The trajectory is the **raw residual-stream hidden state** at the target layer
+(saved as `last_hidden` in activations.pt) projected onto each cluster's SVD
+subspace. These are dense vectors that vary meaningfully across all 400 prompts.
+
+  projected = last_hidden @ subspace_basis.T   # (n_prompts, subspace_dim)
+
+A previous version of this file used the activation-weighted decoder sum,
+which is sparse (SAE features fire on < 1% of prompts per feature), causing the
+trajectory variance to collapse to ~0 and breaking the simplex fit. The Riechers
+framework operates on the dense state itself, not the SAE codes.
+
 Theoretical grounding (Riechers et al. 2025)
 ---------------------------------------------
 SAEs assume every hidden state decomposes as a non-negative sparse linear
-combination of decoder directions: x ≈ Σ_i s_i d_i, with s_i ≥ 0 (the ReLU
-non-linearity enforces this in practice). This is precisely the classical-mixture
-assumption: each prompt's state is a convex combination of a finite set of
-"pure" directions (the archetypes).
+combination of decoder directions: x ≈ Σ_i s_i d_i, with s_i ≥ 0. This is
+precisely the classical-mixture assumption: each prompt's state is a convex
+combination of a finite set of "pure" directions (the archetypes).
 
 Quantum geometry means the actual state space of the cluster is not a simplex
 but a curved convex body (like a Bloch sphere). Points on such a body cannot
-always be written as convex combinations of a small set of extremal points — the
-unconstrained least-squares mixing weights (S_free) must go negative to fit the
-data. The gap between constrained-simplex FVU (classical) and unconstrained FVU
-(quantum) directly measures this deficit.
+always be written as convex combinations of a small set of extremal points —
+the unconstrained least-squares mixing weights (S_free) must go negative to fit
+the data. The gap between constrained-simplex FVU (classical) and unconstrained
+FVU (quantum) directly measures this deficit.
 
 Algorithm per cluster
 ---------------------
-1.  Project activation trajectory into the cluster's low-dimensional subspace.
+1.  Project `last_hidden` (raw residual stream) into the cluster's subspace.
 2.  Fit K=4 simplex archetypes to the trajectory via farthest-point init +
     coordinate descent (constrained NNLS per prompt, unconstrained lstsq for A).
 3.  Solve the SAME system without non-negativity constraints (S_free).
@@ -126,14 +138,15 @@ def _fit_simplex(
 
 def classify_cluster_geometry(
     cluster: dict,
-    feature_activations: torch.Tensor,  # (n_prompts, n_features_total)
+    last_hidden_np: np.ndarray,         # (n_prompts, d_model)  raw residual-stream states
     n_archetypes: int = K_ARCHETYPES,   # kept for API compat
     n_iters: int = AA_ITERS,            # kept for API compat
 ) -> dict:
     """
     Classify the geometry of one cluster by comparing constrained-simplex
     (classical) vs unconstrained (quantum) reconstruction of its activation
-    trajectory across prompts.
+    trajectory — the raw residual-stream hidden states projected onto the
+    cluster subspace.
 
     Returns a dict with keys:
         cluster_id, n_features,
@@ -141,31 +154,27 @@ def classify_cluster_geometry(
         classical_fvu, quantum_fvu,
         classification
     """
-    feat_idx  = cluster["feature_indices"].numpy()         # (n_feat,)
-    dec_vecs  = cluster["decoder_vectors"].numpy().astype(np.float32)   # (n_feat, d_model)
     basis     = cluster["subspace_basis"].numpy().astype(np.float32)    # (sub_dim, d_model)
     sub_dim   = basis.shape[0]
+    n_feat    = int(len(cluster["feature_indices"]))
 
     # Require enough subspace dimensions to fit K archetypes
     if sub_dim < K_ARCHETYPES:
         return _degenerate_result(cluster, reason="subspace_dim < K_ARCHETYPES")
 
     # ------------------------------------------------------------------
-    # Step 1 — activation trajectory in cluster subspace
+    # Step 1 — project raw residual-stream states onto cluster subspace
     # ------------------------------------------------------------------
-    # cluster_acts : (n_prompts, n_feat)
-    cluster_acts = feature_activations[:, feat_idx].numpy().astype(np.float32)
+    # last_hidden_np is dense and varies meaningfully across all 400 prompts.
+    # subspace_basis rows are orthonormal, so the projection is just a matmul.
+    proj_all = (last_hidden_np @ basis.T).astype(np.float32)   # (n_prompts, sub_dim)
 
-    # activation-weighted decoder sum per prompt: (n_prompts, d_model)
-    act_weighted = cluster_acts @ dec_vecs
-
-    # project onto subspace: (n_prompts, sub_dim)
-    projected = act_weighted @ basis.T                     # (n_prompts, sub_dim)
-
-    # Use ALL prompts — no active-mask filtering. Even prompts where the
-    # cluster's features didn't activate contribute (as the origin) to the
-    # trajectory geometry and inform the simplex fit.
-    proj_all = projected.astype(np.float32)               # (n_prompts, sub_dim)
+    # Sanity-check the trajectory variance — if this is ~0 something is wrong
+    sanity_var = float(((proj_all - proj_all.mean(axis=0)) ** 2).sum())
+    print(f"  [debug] cluster {int(cluster['cluster_id']):3d}  total_var={sanity_var:.6f}")
+    if sanity_var < 1e-6:
+        print(f"  WARNING: cluster {int(cluster['cluster_id'])} still has "
+              f"near-zero variance — check data")
 
     # ------------------------------------------------------------------
     # Step 2 — fit simplex archetypes (constrained reconstruction)
@@ -241,7 +250,7 @@ def classify_cluster_geometry(
 
     print(
         f"  cluster {cluster['cluster_id']:3d}: "
-        f"n_features={len(feat_idx):4d}, "
+        f"n_features={n_feat:4d}, "
         f"qness={quantum_ness_score:.4f}, "
         f"neg_wt={negative_weight_fraction:.3f}, "
         f"class={classification}, "
@@ -251,7 +260,7 @@ def classify_cluster_geometry(
 
     return {
         "cluster_id":              int(cluster["cluster_id"]),
-        "n_features":              int(len(feat_idx)),
+        "n_features":              n_feat,
         "quantum_ness_score":      quantum_ness_score,
         "negative_weight_fraction": negative_weight_fraction,
         "classical_fvu":           classical_fvu,
@@ -283,10 +292,46 @@ def _degenerate_result(
 # Run all clusters
 # ---------------------------------------------------------------------------
 
+def _extract_last_hidden(activations) -> np.ndarray:
+    """
+    Pull last_hidden out of the activations dict.
+
+    Accepts either:
+      - a dict (preferred — output of sae_extractor.extract_activations)
+        containing key 'last_hidden', or 'sae_reconstruction' + 'residual'
+      - a tensor (legacy call site passing feature_activations directly —
+        we cannot recover last_hidden from that, so we raise)
+
+    Returns a (n_prompts, d_model) float32 numpy array.
+    """
+    if not isinstance(activations, dict):
+        raise TypeError(
+            "classify_all_clusters now requires the activations DICT "
+            "(with 'last_hidden' or 'sae_reconstruction'+'residual'), "
+            "not just feature_activations."
+        )
+
+    if "last_hidden" in activations and activations["last_hidden"] is not None:
+        lh = activations["last_hidden"]
+    else:
+        # Reconstruct from sae_reconstruction + residual — exact by definition,
+        # since residual = last_hidden - sae_reconstruction.
+        if "sae_reconstruction" not in activations or "residual" not in activations:
+            raise KeyError(
+                "activations dict has neither 'last_hidden' nor both "
+                "'sae_reconstruction' and 'residual' — cannot recover hidden states."
+            )
+        lh = activations["sae_reconstruction"] + activations["residual"]
+        print("[geometry] last_hidden key missing — reconstructed from "
+              "sae_reconstruction + residual")
+
+    return lh.float().numpy() if hasattr(lh, "float") else np.asarray(lh, dtype=np.float32)
+
+
 def classify_all_clusters(
     model_cfg: dict,
     clusters: list[dict],
-    feature_activations: torch.Tensor,   # (n_prompts, n_features_total)
+    activations,                          # dict from sae_extractor (preferred)
     results_dir: str = RESULTS_DIR,
     force_reclassify: bool = False,
 ) -> list[dict]:
@@ -298,8 +343,9 @@ def classify_all_clusters(
         print(f"[geometry] Loaded {len(geo)} cluster geometry results")
         return geo
 
+    last_hidden_np = _extract_last_hidden(activations)
     print(f"[geometry] Classifying {len(clusters)} clusters ...")
-    print(f"[geometry] feature_activations shape: {feature_activations.shape}")
+    print(f"[geometry] last_hidden shape: {last_hidden_np.shape}")
     print(f"[geometry] Method: activation-trajectory simplex gap (K={K_ARCHETYPES})")
 
     # Reset debug-print counter so we see fresh FVU values for the first 5 clusters
@@ -310,7 +356,7 @@ def classify_all_clusters(
     class_counts = {"classical": 0, "quantum": 0, "ambiguous": 0}
 
     for cluster in tqdm(clusters, desc="Classifying clusters"):
-        geo = classify_cluster_geometry(cluster, feature_activations)
+        geo = classify_cluster_geometry(cluster, last_hidden_np)
         results.append(geo)
         class_counts[geo["classification"]] += 1
 
@@ -339,10 +385,10 @@ if __name__ == "__main__":
     import tempfile
     from config import get_active_models
 
-    print("=== Smoke test: geometry_classifier (activation-trajectory simplex gap) ===\n")
+    print("=== Smoke test: geometry_classifier (residual-stream trajectory) ===\n")
     rng = np.random.default_rng(42)
 
-    n_prompts, n_features, d_model, sub_dim = 80, 200, 64, 10
+    n_prompts, d_model, sub_dim = 80, 64, 10
 
     def _make_cluster(cid, n_feat=30):
         dec = rng.standard_normal((n_feat, d_model)).astype(np.float32)
@@ -355,45 +401,43 @@ if __name__ == "__main__":
             "subspace_basis":  torch.tensor(Vt[:sub_dim].astype(np.float32)),
         }
 
-    # ---- Test 1: simplex-like activations (classical) ----
-    # Make activations that are convex combinations of K vertices
-    vertices = rng.standard_normal((K_ARCHETYPES, n_features)).astype(np.float32)
-    vertices = np.abs(vertices)                           # non-negative directions
-    weights  = rng.dirichlet(np.ones(K_ARCHETYPES), size=n_prompts).astype(np.float32)
-    fa_classical = torch.from_numpy(weights @ vertices)  # (n_prompts, n_features)
+    # Dense, varied residual-stream states across 80 prompts
+    last_hidden = rng.standard_normal((n_prompts, d_model)).astype(np.float32)
 
     cl1 = _make_cluster(0)
-    r1  = classify_cluster_geometry(cl1, fa_classical)
-    print(f"\nClassical input: qness={r1['quantum_ness_score']:.4f}  "
+    r1  = classify_cluster_geometry(cl1, last_hidden)
+    print(f"\nGaussian hidden states: qness={r1['quantum_ness_score']:.4f}  "
           f"class={r1['classification']}")
 
-    # ---- Test 2: mixed activations with negative-weight structure ----
-    fa_mixed = torch.from_numpy(
-        rng.standard_normal((n_prompts, n_features)).astype(np.float32)
-    )
+    # A second test where the trajectory lives on a low-rank manifold (more classical)
+    low_rank = rng.standard_normal((n_prompts, 3)).astype(np.float32) \
+               @ rng.standard_normal((3, d_model)).astype(np.float32)
     cl2 = _make_cluster(1)
-    r2  = classify_cluster_geometry(cl2, fa_mixed)
-    print(f"Mixed input:     qness={r2['quantum_ness_score']:.4f}  "
+    r2  = classify_cluster_geometry(cl2, low_rank)
+    print(f"Low-rank hidden states: qness={r2['quantum_ness_score']:.4f}  "
           f"class={r2['classification']}")
 
-    # ---- Sanity: all scores in [0, 1] ----
     for r in (r1, r2):
-        assert 0.0 <= r["quantum_ness_score"] <= 1.0, \
-            f"Score out of range: {r['quantum_ness_score']}"
+        assert 0.0 <= r["quantum_ness_score"] <= 1.0
         assert 0.0 <= r["negative_weight_fraction"] <= 1.0
 
-    # ---- Full pipeline ----
+    # Full pipeline — exercise the activations-dict API
     models = get_active_models()
     if models:
         m = models[0]
-        fa = torch.from_numpy(
-            rng.exponential(size=(n_prompts, n_features)).astype(np.float32)
-        )
+        activations_dict = {
+            "feature_activations": torch.zeros(n_prompts, 200),
+            "sae_reconstruction":   torch.from_numpy(last_hidden * 0.7),
+            "residual":             torch.from_numpy(last_hidden * 0.3),
+            "last_hidden":          torch.from_numpy(last_hidden),
+            "fvu_per_prompt":       torch.zeros(n_prompts),
+        }
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, m["name"]), exist_ok=True)
             clusters = [_make_cluster(i) for i in range(4)]
             geo = classify_all_clusters(
-                m, clusters, fa, results_dir=tmpdir, force_reclassify=True
+                m, clusters, activations_dict,
+                results_dir=tmpdir, force_reclassify=True,
             )
             print(f"\nclassify_all_clusters: {len(geo)} results")
 

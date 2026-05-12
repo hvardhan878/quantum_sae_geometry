@@ -295,6 +295,7 @@ def extract_activations(
     all_feat_acts = []
     all_recons = []
     all_residuals = []
+    all_hidden = []
     all_fvus = []
     start_batch = 0
 
@@ -304,6 +305,7 @@ def extract_activations(
         all_feat_acts = ckpt["feature_activations"]
         all_recons = ckpt["sae_reconstruction"]
         all_residuals = ckpt["residual"]
+        all_hidden = ckpt.get("last_hidden", [])
         all_fvus = ckpt["fvu_per_prompt"]
         start_batch = ckpt["next_batch"]
         print(f"[sae_extractor] Resuming from batch {start_batch} "
@@ -356,6 +358,7 @@ def extract_activations(
         all_feat_acts.append(feat_acts.cpu())
         all_recons.append(recon.cpu())
         all_residuals.append(residual.cpu())
+        all_hidden.append(last_hidden_f32.cpu())
         all_fvus.append(fvu.cpu())
 
         # Checkpoint
@@ -363,7 +366,7 @@ def extract_activations(
         if (global_batch + 1) % CHECKPOINT_EVERY == 0:
             _save_checkpoint(
                 ckpt_path,
-                all_feat_acts, all_recons, all_residuals, all_fvus,
+                all_feat_acts, all_recons, all_residuals, all_hidden, all_fvus,
                 next_batch=global_batch + 1,
             )
 
@@ -374,6 +377,7 @@ def extract_activations(
         "feature_activations": torch.cat(all_feat_acts, dim=0),   # (N, n_features)
         "sae_reconstruction": torch.cat(all_recons, dim=0),        # (N, d_model)
         "residual": torch.cat(all_residuals, dim=0),               # (N, d_model)
+        "last_hidden": torch.cat(all_hidden, dim=0),               # (N, d_model)
         "fvu_per_prompt": torch.cat(all_fvus, dim=0),              # (N,)
     }
 
@@ -391,11 +395,12 @@ def extract_activations(
     return results
 
 
-def _save_checkpoint(path, feat_acts, recons, residuals, fvus, next_batch):
+def _save_checkpoint(path, feat_acts, recons, residuals, hiddens, fvus, next_batch):
     ckpt = {
         "feature_activations": feat_acts,
         "sae_reconstruction": recons,
         "residual": residuals,
+        "last_hidden": hiddens,
         "fvu_per_prompt": fvus,
         "next_batch": next_batch,
     }
