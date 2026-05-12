@@ -17,8 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import RESULTS_DIR
+from config import RESULTS_DIR
 
 # Colour mapping for classification labels
 CLASS_COLORS = {
@@ -160,7 +159,7 @@ def visualize_model(model_cfg: dict, results_dir: str = RESULTS_DIR) -> None:
 
 if __name__ == "__main__":
     import tempfile
-    from quantum_belief_geometry.config import get_active_models
+    from config import get_active_models
 
     print("=== Smoke test: visualize ===")
     rng = np.random.default_rng(0)

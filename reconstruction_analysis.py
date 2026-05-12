@@ -25,8 +25,7 @@ import numpy as np
 from scipy.stats import spearmanr
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import RESULTS_DIR
+from config import RESULTS_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +167,7 @@ def run_reconstruction_analysis(
 
 if __name__ == "__main__":
     import tempfile
-    from quantum_belief_geometry.config import get_active_models
+    from config import get_active_models
 
     print("=== Smoke test: reconstruction_analysis ===")
     rng = np.random.default_rng(42)

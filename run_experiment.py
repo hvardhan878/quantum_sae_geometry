@@ -10,8 +10,8 @@ For each active model in config:
   6. Visualise and save results.
 
 Usage:
-    python -m quantum_belief_geometry.run_experiment
-    python -m quantum_belief_geometry.run_experiment --n_prompts 50  # quick test
+    python run_experiment.py
+    python run_experiment.py --n_prompts 50          # quick test
 """
 
 import argparse
@@ -22,20 +22,19 @@ import traceback
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import (
+from config import (
     get_active_models,
     RESULTS_DIR,
     N_PROMPTS,
     N_CLUSTERS,
     MIN_CLUSTER_SIZE,
 )
-from quantum_belief_geometry.data_loader import build_dataloader
-from quantum_belief_geometry.sae_extractor import extract_activations, _final_path
-from quantum_belief_geometry.clustering import cluster_decoder_vectors
-from quantum_belief_geometry.geometry_classifier import classify_all_clusters
-from quantum_belief_geometry.reconstruction_analysis import run_reconstruction_analysis
-from quantum_belief_geometry.visualize import visualize_model
+from data_loader import build_dataloader
+from sae_extractor import extract_activations, _final_path
+from clustering import cluster_decoder_vectors
+from geometry_classifier import classify_all_clusters
+from reconstruction_analysis import run_reconstruction_analysis
+from visualize import visualize_model
 
 
 # ---------------------------------------------------------------------------

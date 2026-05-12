@@ -19,8 +19,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import (
+from config import (
     RESULTS_DIR,
     CHECKPOINT_EVERY,
     RECONSTRUCTION_METRIC,
@@ -249,8 +248,8 @@ def _save_checkpoint(path, feat_acts, recons, residuals, fvus, next_batch):
 
 if __name__ == "__main__":
     import tempfile
-    from quantum_belief_geometry.config import get_active_models
-    from quantum_belief_geometry.data_loader import build_dataloader
+    from config import get_active_models
+    from data_loader import build_dataloader
 
     models = get_active_models()
     if not models:

@@ -14,8 +14,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import DATASET, N_PROMPTS, RESULTS_DIR
+from config import DATASET, N_PROMPTS, RESULTS_DIR
 
 
 def get_cache_path(model_name: str, results_dir: str = RESULTS_DIR) -> str:
@@ -94,7 +93,7 @@ def build_dataloader(
 
 if __name__ == "__main__":
     # Quick smoke-test on 10 prompts using the first active model
-    from quantum_belief_geometry.config import get_active_models
+    from config import get_active_models
     import tempfile
 
     models = get_active_models()

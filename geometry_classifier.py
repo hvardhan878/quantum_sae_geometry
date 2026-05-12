@@ -46,13 +46,11 @@ Our test
 """
 
 import os
-import sys
 import torch
 import numpy as np
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quantum_belief_geometry.config import (
+from config import (
     AANET_ITERS,
     AANET_N_ARCHETYPES,
     RESULTS_DIR,
@@ -404,7 +402,7 @@ def classify_all_clusters(
 
 if __name__ == "__main__":
     import tempfile
-    from quantum_belief_geometry.config import get_active_models
+    from config import get_active_models
 
     print("=== Smoke test: geometry_classifier ===")
     rng = np.random.default_rng(0)
