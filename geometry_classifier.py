@@ -159,49 +159,44 @@ def classify_cluster_geometry(
     # project onto subspace: (n_prompts, sub_dim)
     projected = act_weighted @ basis.T                     # (n_prompts, sub_dim)
 
-    # Drop prompts that never activate this cluster
-    norms = np.linalg.norm(projected, axis=1)
-    active = norms > 1e-6
-    if active.sum() < K_ARCHETYPES + 1:
-        return _degenerate_result(cluster, reason="too_few_active_prompts")
-
-    proj_active = projected[active].astype(np.float32)     # (n_active, sub_dim)
-    n_active = proj_active.shape[0]
+    # Use ALL prompts — no active-mask filtering. Even prompts where the
+    # cluster's features didn't activate contribute (as the origin) to the
+    # trajectory geometry and inform the simplex fit.
+    proj_all = projected.astype(np.float32)               # (n_prompts, sub_dim)
 
     # ------------------------------------------------------------------
     # Step 2 — fit simplex archetypes (constrained reconstruction)
     # ------------------------------------------------------------------
-    A, S = _fit_simplex(proj_active, K=K_ARCHETYPES, n_iters=AA_ITERS)
-    # A : (K, sub_dim),  S : (n_active, K)  rows sum to 1, all >= 0
-    classical_recon = S @ A                                # (n_active, sub_dim)
+    A, S = _fit_simplex(proj_all, K=K_ARCHETYPES, n_iters=AA_ITERS)
+    # A : (K, sub_dim),  S : (n_prompts, K)  rows sum to 1, all >= 0
+    classical_recon = S @ A                                # (n_prompts, sub_dim)
 
     # ------------------------------------------------------------------
     # Step 3 — unconstrained reconstruction with the same archetypes
     # ------------------------------------------------------------------
-    # Solve  A^T s_i = proj_i  (no constraints) for all prompts simultaneously:
-    #   A.T  : (sub_dim, K)
-    #   proj : (sub_dim, n_active)
-    #   → solution shape (K, n_active), transpose to (n_active, K)
-    AT = A.T.astype(np.float64)
+    # We want to solve  A^T s_i = proj_i  per prompt (no constraints).
+    # Stack: solve in normal-equation form with ridge regularisation to keep
+    # things numerically stable when archetypes are nearly collinear.
+    #
+    #   min_S  || S A - projected ||^2 + λ || S ||^2
+    #   →  (A A^T + λ I) S^T = A projected^T
+    K = A.shape[0]
+    try:
+        ATA_reg = (A @ A.T).astype(np.float64) + 1e-4 * np.eye(K, dtype=np.float64)
+        ATP = (A @ proj_all.T).astype(np.float64)         # (K, n_prompts)
+        S_free = np.linalg.solve(ATA_reg, ATP).T.astype(np.float32)  # (n_prompts, K)
+    except np.linalg.LinAlgError as e:
+        return _degenerate_result(cluster, reason=f"linalg_error: {e}")
 
-    # Condition-number guard: degenerate A → fall back
-    cond = np.linalg.cond(AT)
-    if not np.isfinite(cond) or cond > 1e6:
-        return _degenerate_result(cluster, reason="ill_conditioned_archetypes")
-
-    S_free_T, _, _, _ = np.linalg.lstsq(
-        AT, proj_active.T.astype(np.float64), rcond=None
-    )
-    S_free = S_free_T.T.astype(np.float32)                # (n_active, K)
-    quantum_recon = S_free @ A                             # (n_active, sub_dim)
+    quantum_recon = S_free @ A                             # (n_prompts, sub_dim)
 
     # ------------------------------------------------------------------
     # Step 4 — FVU gap = quantum-ness score
     # ------------------------------------------------------------------
-    centered   = proj_active - proj_active.mean(axis=0)
+    centered   = proj_all - proj_all.mean(axis=0)
     total_var  = float((centered ** 2).sum())
 
-    classical_residual = proj_active - classical_recon
+    classical_residual = proj_all - classical_recon
     classical_fvu      = float((classical_residual ** 2).sum()) / (total_var + 1e-8)
 
     # Trivially-easy clusters have no interesting geometry
@@ -209,7 +204,7 @@ def classify_cluster_geometry(
         return _degenerate_result(cluster, reason="trivially_low_classical_fvu",
                                   classical_fvu=classical_fvu)
 
-    quantum_residual = proj_active - quantum_recon
+    quantum_residual = proj_all - quantum_recon
     quantum_fvu      = float((quantum_residual ** 2).sum()) / (total_var + 1e-8)
 
     # Clamp to [0, 1]: the gap cannot be negative (unconstrained ≤ constrained error)
