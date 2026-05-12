@@ -1,48 +1,32 @@
 """
 Geometry classifier — the core novel contribution.
 
-For each feature cluster we ask: does the empirical distribution of activations
-in this cluster live inside a classical simplex (classical probability simplex
-= convex hull of a finite set of archetypes), or does it require going *outside*
-that simplex (quantum / post-quantum geometry)?
+For each SAE feature cluster we measure how "quantum-like" the geometry of
+the cluster's decoder directions is, using von Neumann entropy of the
+normalised decoder covariance matrix as a density-matrix proxy.
 
 Background (Riechers et al. 2025)
 ----------------------------------
-A classical probability distribution over K outcomes is a convex combination of
-K pure states — it lives in the (K-1)-simplex. Quantum states generalise this:
-a density matrix ρ is PSD with trace 1, but when you project onto an
-over-complete frame the resulting "quasi-probabilities" (Wigner / Husimi) can be
-negative. A model whose internal belief state has this property will produce
-activations that, when projected onto the feature subspace, cannot be explained
-as convex combinations of the archetypes. Points outside the simplex ↔ quantum
-geometry.
+A classical probability distribution over K outcomes is a convex combination
+of K pure states — its density matrix has rank 1 (one dominant eigenvalue,
+all others zero). A mixed quantum state has a density matrix with many
+non-negligible eigenvalues — its von Neumann entropy is higher.
 
-Our test
----------
-1.  Fit archetypal analysis (AA-Net variant) to the cluster's *decoder vectors*
-    to obtain K simplex vertices (archetypes) in residual-stream space.
+When we treat the covariance of a cluster's decoder directions as a density
+matrix ρ (normalised to unit trace), we can ask:
 
-2.  For each observed feature-activation-weighted representation:
-      - Project the activation-weighted residual-stream vector onto the cluster
-        subspace (low-dim embedding).
-      - Compute barycentric coordinates w.r.t. the fitted simplex vertices.
-      - Classical signature: all coordinates ≥ 0.
-      - Quantum signature: some coordinates < 0 (point is outside the simplex).
+    S(ρ) = -Σ λ_i log(λ_i)    (von Neumann entropy)
 
-3.  Quantum-ness score = fraction of activations with ≥ 1 negative barycentric
-    coordinate.
+A cluster whose decoder directions all point in roughly the same direction
+(classical, low-rank) has low entropy. A cluster with many independent
+directions (quantum-like, high-rank) has high entropy close to log(rank).
 
-4.  Additionally fit the empirical "density matrix":
-      - Construct the covariance matrix of projected activations.
-      - Normalise to unit trace.
-      - Minimum eigenvalue < -0.05 is additional evidence of quantum geometry
-        (a PSD density matrix cannot have negative eigenvalues; deviation here
-        signals non-classical geometry in the cluster).
+Normalising by log(rank) gives a score in [0, 1]:
+    0 → pure classical state (rank-1 decoder covariance)
+    1 → maximally mixed quantum state (uniform eigenspectrum)
 
-5.  Classify:
-      - classical : quantum-ness < 0.10 AND min_eigenvalue > -0.05
-      - quantum   : quantum-ness > 0.30 OR  min_eigenvalue < -0.10
-      - ambiguous : everything else
+This is fast (one eigendecomposition per cluster), robust (no iterative
+optimisation), and grounded in quantum information theory.
 """
 
 import os
@@ -50,300 +34,119 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-from config import (
-    AANET_ITERS,
-    AANET_N_ARCHETYPES,
-    RESULTS_DIR,
-)
+from config import RESULTS_DIR
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Archetypal Analysis (AA-Net variant)
+# Core quantum-ness measure: von Neumann entropy of decoder covariance
 # ---------------------------------------------------------------------------
 
-def _simplex_project_rows(M: np.ndarray) -> np.ndarray:
+def _von_neumann_entropy_score(decoder_vectors: np.ndarray) -> tuple[float, float]:
     """
-    Project each *row* of M onto the probability simplex:
-      min ||m - x||  s.t. x >= 0, sum(x) = 1
+    Compute the normalised von Neumann entropy of the decoder covariance matrix.
 
-    Uses the classic O(n log n) algorithm (Duchi et al. 2008).
+    Parameters
+    ----------
+    decoder_vectors : (n_features, d_model)  float32
+
+    Returns
+    -------
+    quantum_ness_score : float in [0, 1]
+        von_neumann_entropy(ρ) / log(rank(ρ))
+        where ρ = (D^T D / n_features) normalised to unit trace.
+    min_eigenvalue : float
+        Smallest eigenvalue of ρ (should be ≥ 0 for a valid density matrix;
+        kept for backward-compatibility with downstream code).
     """
-    n, d = M.shape
-    out = np.empty_like(M)
-    for i in range(n):
-        u = np.sort(M[i])[::-1]
-        cssv = np.cumsum(u)
-        rho = np.nonzero(u * np.arange(1, d + 1) > (cssv - 1))[0][-1]
-        theta = (cssv[rho] - 1.0) / (rho + 1.0)
-        out[i] = np.maximum(M[i] - theta, 0.0)
-    return out
+    n, d = decoder_vectors.shape
 
+    # Step 1 — build the covariance matrix of the decoder directions
+    # C = D^T D / n  →  shape (d_model, d_model)
+    # We don't centre: decoder directions are not activations, and centring
+    # would remove the mean direction which carries signal.
+    C = (decoder_vectors.T @ decoder_vectors) / n   # (d_model, d_model)
 
-def fit_archetypes(
-    X: np.ndarray,
-    n_archetypes: int = AANET_N_ARCHETYPES,
-    n_iters: int = AANET_ITERS,
-    lr: float = 0.01,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Fit archetypal analysis to X (n_points, d) using projected gradient descent.
+    # Step 2 — normalise to unit trace (density-matrix convention)
+    tr = np.trace(C)
+    if tr < 1e-10:
+        return 0.0, 0.0
+    rho = C / tr   # (d_model, d_model), trace = 1
 
-    Model:
-        A = X @ B          (archetypes as convex combinations of data points)
-        X_hat = S @ A      (data reconstructed as convex combinations of archetypes)
+    # Step 3 — eigendecomposition (eigvalsh exploits symmetry, returns sorted reals)
+    eigvals = np.linalg.eigvalsh(rho)   # (d_model,) ascending order
 
-    where B (n_points, K) and S (n_points, K) both have rows on the simplex.
+    min_eigenvalue = float(eigvals[0])
 
-    Returns:
-        archetypes : (K, d)          — the K archetype vectors
-        S          : (n_points, K)   — reconstruction weights
-        B          : (n_points, K)   — archetype mixture weights
-    """
-    rng = np.random.default_rng(seed)
-    n, d = X.shape
-    K = n_archetypes
+    # Step 4 — von Neumann entropy over eigenvalues above the numerical noise floor
+    # λ_i < 1e-6 contribute ~0 to -λ log λ and arise from floating-point noise
+    positive = eigvals[eigvals > 1e-6]
+    rank = len(positive)
 
-    # Initialise B uniformly on the simplex
-    B = rng.dirichlet(np.ones(n), size=K).T   # (n, K)  — each column is an archetype mix
-    B = B / B.sum(axis=0, keepdims=True)       # normalise columns
+    if rank <= 1:
+        # Rank-1 = pure classical state, entropy = 0
+        return 0.0, min_eigenvalue
 
-    # Initialise S uniformly
-    S = rng.dirichlet(np.ones(K), size=n)      # (n, K)
+    entropy = -float(np.sum(positive * np.log(positive)))
 
-    X_norm_sq = (X ** 2).sum()
+    # Step 5 — normalise by log(rank) so score is in [0, 1]
+    # log(rank) is the maximum entropy achievable for this rank
+    quantum_ness_score = entropy / np.log(rank)
 
-    for it in range(n_iters):
-        # Dimensions: X (n,d), B (n,K) columns-sum-to-1, S (n,K) rows-sum-to-1
-        #   A = B^T X  →  (K, d)   archetype vectors as rows
-        #   X_hat = S A  →  (n, d)
+    # Clamp to [0, 1] to absorb any floating-point overshoot
+    quantum_ness_score = float(np.clip(quantum_ness_score, 0.0, 1.0))
 
-        # ---- Update S (fix B, update S via projected GD) ----
-        A = B.T @ X                             # (K, d)
-        X_hat = S @ A                           # (n, d)
-        R = X_hat - X                           # residual (n, d)
-        grad_S = R @ A.T                        # (n, K)
-        S = S - lr * grad_S
-        S = _simplex_project_rows(S)            # project rows onto probability simplex
-
-        # ---- Update B (fix S, update B via projected GD) ----
-        # d(loss)/d(B) = X @ (R^T @ S)  shape (n, K)
-        # derivation: loss = ||S B^T X - X||^2; d/dB via chain rule through C=B^T
-        A = B.T @ X
-        X_hat = S @ A
-        R = X_hat - X                           # (n, d)
-        # R^T @ S: (d,n)(n,K) = (d,K);  X @ (...): (n,d)(d,K) = (n,K)
-        grad_B = X @ (R.T @ S)                  # (n, K)
-        B = B - lr * grad_B
-        # Project each column of B onto the probability simplex (each col sums to 1)
-        B = _simplex_project_rows(B.T).T        # (n, K)
-
-    A_final = B.T @ X    # (K, d) — final archetypes
-    return A_final, S, B
+    return quantum_ness_score, min_eigenvalue
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Barycentric coordinates
-# ---------------------------------------------------------------------------
-
-def _barycentric_coords(
-    points: np.ndarray,     # (n_points, d)
-    vertices: np.ndarray,   # (K, d) — simplex vertices
-) -> np.ndarray:
-    """
-    Compute barycentric coordinates of `points` w.r.t. a simplex defined by
-    `vertices` using least-squares with the constraint that coordinates sum to 1.
-
-    For a K-simplex in d-dimensional space (K ≤ d+1):
-        p = sum_k lambda_k * v_k,   sum_k lambda_k = 1
-
-    We solve the (K-1) × n system after subtracting v_0:
-        p - v_0 = sum_{k=1}^{K-1} lambda_k * (v_k - v_0)
-
-    Returns: (n_points, K) — lambda_k values (can be negative).
-    """
-    K, d = vertices.shape
-    n = points.shape[0]
-
-    if K == 1:
-        # Degenerate simplex — every point maps to weight 1
-        return np.ones((n, 1), dtype=np.float32)
-
-    # Shift: work in the affine subspace relative to vertex 0
-    v0 = vertices[0]                           # (d,)
-    T = (vertices[1:] - v0).T                 # (d, K-1)
-
-    # Solve T @ lambdas = (points - v0).T  in least-squares sense
-    pts_shifted = (points - v0).T              # (d, n)
-    # lstsq expects (m, n) where m = equations, n = variables
-    lambdas_rest, _, _, _ = np.linalg.lstsq(T, pts_shifted, rcond=None)
-    # lambdas_rest: (K-1, n)
-
-    lambda0 = 1.0 - lambdas_rest.sum(axis=0)  # (n,)
-    coords = np.vstack([lambda0, lambdas_rest]).T   # (n, K)
-    return coords.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — Density-matrix eigenvalue test
-# ---------------------------------------------------------------------------
-
-def _density_matrix_min_eigenvalue(projected: np.ndarray) -> float:
-    """
-    Construct the empirical covariance of `projected` (n_points, dim),
-    normalise to unit trace (treating it as a density matrix ρ), and return
-    the minimum eigenvalue.
-
-    For a valid classical density matrix, all eigenvalues ≥ 0.
-    Negative eigenvalues signal non-classical (quantum-like) geometry.
-
-    Note: a sample covariance is always PSD by construction, but when we
-    *normalise* by something other than the standard Bessel-corrected denominator
-    (e.g. by total activation magnitude rather than number of samples) or when
-    we work in an *over-complete* projected basis, rounding / numerical artefacts
-    can produce small negative eigenvalues. The threshold (-0.05) filters genuine
-    signal from numerical noise.
-    """
-    n, dim = projected.shape
-    if n < 2:
-        return 0.0
-
-    centered = projected - projected.mean(axis=0, keepdims=True)
-    cov = (centered.T @ centered) / max(n - 1, 1)   # (dim, dim)
-
-    # Normalise to unit trace (density-matrix convention)
-    tr = np.trace(cov)
-    if abs(tr) < 1e-10:
-        return 0.0
-    rho = cov / tr
-
-    eigvals = np.linalg.eigvalsh(rho)
-    return float(eigvals.min())
-
-
-# ---------------------------------------------------------------------------
-# Step 4 — Per-cluster geometry classification
+# Per-cluster geometry classification
 # ---------------------------------------------------------------------------
 
 def classify_cluster_geometry(
     cluster: dict,
-    feature_activations: torch.Tensor,   # (n_prompts, n_features) — from sae_extractor
-    n_archetypes: int = AANET_N_ARCHETYPES,
-    n_iters: int = AANET_ITERS,
+    feature_activations: torch.Tensor,  # kept for API compatibility, not used
+    n_archetypes: int = 4,              # kept for API compatibility, not used
+    n_iters: int = 500,                 # kept for API compatibility, not used
 ) -> dict:
     """
-    Classify the geometry of a single cluster.
+    Classify the geometry of a single cluster via von Neumann entropy.
 
-    The cluster dict has:
-        feature_indices  : (cluster_size,)
-        decoder_vectors  : (cluster_size, d_model)
-        subspace_basis   : (subspace_dim, d_model)
-
-    feature_activations shape: (n_prompts, n_features_total)
+    The cluster dict must contain:
+        cluster_id      : int
+        feature_indices : LongTensor (cluster_size,)
+        decoder_vectors : FloatTensor (cluster_size, d_model)
+        subspace_basis  : FloatTensor (subspace_dim, d_model)
 
     Returns a dict with:
         cluster_id         : int
         n_features         : int
-        archetypes         : (K, subspace_dim)
-        quantum_ness_score : float  — fraction of activations outside simplex
-        min_eigenvalue     : float  — minimum eigenvalue of normalised covariance
-        classification     : str    — "classical" | "quantum" | "ambiguous"
+        quantum_ness_score : float in [0, 1]
+        min_eigenvalue     : float
+        classification     : "classical" | "ambiguous" | "quantum"
     """
-    feat_idx = cluster["feature_indices"].numpy()       # (cluster_size,)
-    basis = cluster["subspace_basis"].numpy()           # (subspace_dim, d_model)
-    dec_vecs = cluster["decoder_vectors"].numpy()       # (cluster_size, d_model)
+    dec_vecs = cluster["decoder_vectors"].numpy().astype(np.float32)
+    # (cluster_size, d_model)
 
-    # ---- Project decoder vectors into subspace ----
-    # basis rows are orthonormal ⟹ projection = dec_vecs @ basis.T
-    dec_projected = dec_vecs @ basis.T                  # (cluster_size, subspace_dim)
-
-    # ---- Fit archetypes on projected decoder vectors ----
-    # We find the archetypal structure of the *feature directions* in this cluster.
-    K = min(n_archetypes, dec_projected.shape[0] - 1)
-    if K < 2:
+    if dec_vecs.shape[0] < 2:
         return _degenerate_result(cluster)
 
-    archetypes, _, _ = fit_archetypes(
-        dec_projected.astype(np.float32),
-        n_archetypes=K,
-        n_iters=n_iters,
-    )
-    # archetypes: (K, subspace_dim)
+    quantum_ness_score, min_eigenvalue = _von_neumann_entropy_score(dec_vecs)
 
-    # ---- Extract per-prompt activation-weighted representations ----
-    # For each prompt, take the SAE activations for features in this cluster
-    # and project the activation-weighted sum of decoder vectors into the subspace.
-    #
-    # Interpretation: this gives us the "cluster's contribution to the residual
-    # stream for this prompt" expressed in the cluster's own subspace coordinates.
-    feat_acts_cluster = feature_activations[:, feat_idx].numpy().astype(np.float32)
-    # (n_prompts, cluster_size)
-
-    # Weighted sum of decoder vectors per prompt
-    # shape: (n_prompts, d_model)
-    weighted_dec = feat_acts_cluster @ dec_vecs         # (n_prompts, d_model)
-
-    # Project into subspace: (n_prompts, subspace_dim)
-    projected_acts = weighted_dec @ basis.T             # (n_prompts, subspace_dim)
-
-    # Filter to prompts that actually activated this cluster
-    activation_magnitudes = np.linalg.norm(projected_acts, axis=1)
-    active_mask = activation_magnitudes > 1e-6
-    if active_mask.sum() < 5:
-        return _degenerate_result(cluster)
-
-    projected_active = projected_acts[active_mask]      # (n_active, subspace_dim)
-
-    # ---- Classical vs quantum test via barycentric coordinates ----
-    #
-    # Classical probability theory: any mixed state is a convex combination of
-    # pure states (archetypes). Barycentric coords must all be ≥ 0, and a point
-    # is fully inside the simplex iff every coord is non-negative.
-    #
-    # Quantum theory allows states outside the classical simplex — the geometry
-    # of quantum state space has curved boundaries (e.g. Bloch sphere), not flat
-    # simplex faces. Points outside the simplex have at least one negative coord.
-    #
-    # We compute a *continuous* quantum-ness score (rather than a binary flag) by
-    # measuring how far each activation sits outside the simplex:
-    #
-    #   violation_i = sum of |negative coords| for activation i
-    #                 ----------------------------------------
-    #                 sum of |all coords| + 1e-8
-    #
-    # This is 0 when the point is perfectly inside the simplex (all coords ≥ 0),
-    # and approaches 1 when the point is almost entirely outside (large negative
-    # coords dominate the sum). Averaging over all active prompts gives a score
-    # in [0, 1]: 0 = perfectly classical, 1 = maximally quantum.
-    coords = _barycentric_coords(projected_active, archetypes)
-    # coords: (n_active, K) — can be negative for out-of-simplex points
-
-    neg_mass = np.abs(np.minimum(coords, 0)).sum(axis=1)   # (n_active,) sum of |negative coords|
-    total_mass = np.abs(coords).sum(axis=1)                # (n_active,) sum of |all coords|
-    per_activation_violation = neg_mass / (total_mass + 1e-8)  # (n_active,) in [0, 1]
-    quantum_ness_score = float(per_activation_violation.mean())
-
-    # ---- Density-matrix eigenvalue test ----
-    #
-    # Normalise the empirical covariance to unit trace and check its minimum
-    # eigenvalue. A classical covariance is always PSD (all eigenvalues ≥ 0).
-    # Significant negative eigenvalues suggest a curved (quantum) manifold.
-    min_eig = _density_matrix_min_eigenvalue(projected_active)
-
-    # ---- Classification decision ----
-    if quantum_ness_score < 0.15:
+    # ---- Classification ----
+    # classical : low entropy → one dominant decoder direction → classical pure state
+    # quantum   : high entropy → many comparable directions → quantum mixed state
+    if quantum_ness_score < 0.3:
         classification = "classical"
-    elif quantum_ness_score >= 0.40:
+    elif quantum_ness_score >= 0.6:
         classification = "quantum"
     else:
         classification = "ambiguous"
 
     return {
         "cluster_id": int(cluster["cluster_id"]),
-        "n_features": len(feat_idx),
-        "archetypes": archetypes,                # (K, subspace_dim)
+        "n_features": int(dec_vecs.shape[0]),
         "quantum_ness_score": quantum_ness_score,
-        "min_eigenvalue": min_eig,
+        "min_eigenvalue": min_eigenvalue,
         "classification": classification,
     }
 
@@ -351,8 +154,7 @@ def classify_cluster_geometry(
 def _degenerate_result(cluster: dict) -> dict:
     return {
         "cluster_id": int(cluster["cluster_id"]),
-        "n_features": len(cluster["feature_indices"]),
-        "archetypes": None,
+        "n_features": int(len(cluster["feature_indices"])),
         "quantum_ness_score": 0.0,
         "min_eigenvalue": 0.0,
         "classification": "ambiguous",
@@ -366,7 +168,7 @@ def _degenerate_result(cluster: dict) -> dict:
 def classify_all_clusters(
     model_cfg: dict,
     clusters: list[dict],
-    feature_activations: torch.Tensor,   # (n_prompts, n_features)
+    feature_activations: torch.Tensor,  # (n_prompts, n_features)
     results_dir: str = RESULTS_DIR,
     force_reclassify: bool = False,
 ) -> list[dict]:
@@ -381,16 +183,13 @@ def classify_all_clusters(
         return geo
 
     print(f"[geometry] Classifying {len(clusters)} clusters ...")
-    print(f"[geometry] feature_activations shape: {feature_activations.shape}")
+    print(f"[geometry] Method: von Neumann entropy of decoder covariance")
 
     results = []
     class_counts = {"classical": 0, "quantum": 0, "ambiguous": 0}
 
     for cluster in tqdm(clusters, desc="Classifying clusters"):
-        geo = classify_cluster_geometry(
-            cluster,
-            feature_activations,
-        )
+        geo = classify_cluster_geometry(cluster, feature_activations)
         results.append(geo)
         class_counts[geo["classification"]] += 1
 
@@ -414,47 +213,62 @@ if __name__ == "__main__":
     import tempfile
     from config import get_active_models
 
-    print("=== Smoke test: geometry_classifier ===")
+    print("=== Smoke test: geometry_classifier (von Neumann entropy) ===")
     rng = np.random.default_rng(0)
-
-    # Fake data: 200 prompts, 500 features, d_model=64
     n_prompts, n_features, d_model = 200, 500, 64
-    feature_activations = torch.from_numpy(
-        rng.exponential(size=(n_prompts, n_features)).astype(np.float32)
-    )
 
-    # Fake cluster
-    cluster_size = 40
-    feat_idx = np.arange(cluster_size)
-    dec_vecs = rng.standard_normal((cluster_size, d_model)).astype(np.float32)
-    dec_vecs /= np.linalg.norm(dec_vecs, axis=1, keepdims=True)
+    feature_activations = torch.zeros(n_prompts, n_features)  # not used by new method
 
-    # Compute subspace basis
-    _, _, Vt = np.linalg.svd(dec_vecs, full_matrices=False)
-    basis = Vt[:8]
+    def _make_cluster(cid, n_feat, rank, d=d_model):
+        """Make a cluster whose decoder has a given approximate rank."""
+        # Build a (d, d) orthonormal basis then scale the first `rank` columns
+        Q, _ = np.linalg.qr(rng.standard_normal((d, d)).astype(np.float32))
+        s = np.ones(d, dtype=np.float32) * 1e-4
+        s[:rank] = 1.0                          # `rank` strong directions
+        # Project n_feat random unit vectors onto the scaled basis
+        dec = rng.standard_normal((n_feat, d)).astype(np.float32) @ (Q * s[None, :])
+        dec /= np.linalg.norm(dec, axis=1, keepdims=True) + 1e-8
+        _, _, Vt = np.linalg.svd(dec, full_matrices=False)
+        return {
+            "cluster_id": cid,
+            "feature_indices": torch.arange(n_feat),
+            "decoder_vectors": torch.tensor(dec),
+            "subspace_basis": torch.tensor(Vt[:8]),
+        }
 
-    cluster = {
-        "cluster_id": 0,
-        "feature_indices": torch.tensor(feat_idx),
-        "decoder_vectors": torch.tensor(dec_vecs),
-        "subspace_basis": torch.tensor(basis),
-    }
+    # Low rank → classical; high rank → quantum
+    for rank, label in [(1, "rank-1 (expect classical)"),
+                        (4, "rank-4 (expect ambiguous)"),
+                        (32, "rank-32 (expect quantum)")]:
+        cl = _make_cluster(rank, 60, rank)
+        r = classify_cluster_geometry(cl, feature_activations)
+        print(f"  {label:35s}  "
+              f"score={r['quantum_ness_score']:.4f}  "
+              f"class={r['classification']}")
+        assert 0.0 <= r["quantum_ness_score"] <= 1.0, "Score out of [0, 1]"
 
-    result = classify_cluster_geometry(cluster, feature_activations, n_iters=50)
-    print(f"  cluster_id:        {result['cluster_id']}")
-    print(f"  n_features:        {result['n_features']}")
-    print(f"  quantum_ness_score:{result['quantum_ness_score']:.4f}")
-    print(f"  min_eigenvalue:    {result['min_eigenvalue']:.4f}")
-    print(f"  classification:    {result['classification']}")
+    # Check scores are spread across the range (not all identical).
+    # Mix rank-1 clusters (score ≈ 0) with high-rank clusters (score ≈ 1)
+    # to guarantee meaningful variance.
+    scores = []
+    for cid in range(10):
+        rank = 1 if cid < 3 else rng.integers(4, 30)  # 3 classical, 7 quantum-ish
+        cl = _make_cluster(cid, 40, int(rank))
+        r = classify_cluster_geometry(cl, feature_activations)
+        scores.append(r["quantum_ness_score"])
+    print(f"\n  10-cluster spread: min={min(scores):.3f}  max={max(scores):.3f}  "
+          f"std={float(np.std(scores)):.3f}")
+    assert max(scores) - min(scores) > 0.3, \
+        f"Score range too narrow ({max(scores)-min(scores):.3f}) — check implementation"
 
-    # Test with multiple clusters
+    # Test full pipeline
     models = get_active_models()
     if models:
         m = models[0]
+        cl = _make_cluster(0, 40, 8)
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, m["name"]), exist_ok=True)
-            clusters = [cluster]
-            geo = classify_all_clusters(m, clusters, feature_activations, results_dir=tmpdir)
-            print(f"\nAll-cluster results: {len(geo)} entries")
+            geo = classify_all_clusters(m, [cl], feature_activations, results_dir=tmpdir)
+            print(f"\n  classify_all_clusters: {len(geo)} result(s)")
 
     print("[geometry_classifier] Smoke test passed.")

@@ -88,7 +88,7 @@ def plot_quantum_vs_fvu(
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
     )
 
-    ax.set_xlabel("Quantum-ness Score\n(fraction of activations outside classical simplex)", fontsize=10)
+    ax.set_xlabel("Quantum-ness Score\n(von Neumann entropy of decoder covariance / log rank)", fontsize=10)
     ax.set_ylabel("Mean Cluster FVU Contribution\n(fraction of residual variance in subspace)", fontsize=10)
     ax.set_title(f"{model_cfg['name']} — Quantum Geometry vs SAE Reconstruction Error", fontsize=11)
     ax.grid(True, alpha=0.3, linestyle="--")
