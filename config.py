@@ -11,7 +11,7 @@ MODELS = [
         "name": "gemma-2-2b-it",
         "hf_name": "google/gemma-2-2b-it",
         "sae_release": "gemma-scope-2b-pt-res",
-        "sae_id": "layer_12/width_16k/average_l0_71",
+        "sae_id": "layer_12/width_16k/average_l0_82",
         "target_layer": 12,
         "dtype": "bfloat16",
         "active": True,

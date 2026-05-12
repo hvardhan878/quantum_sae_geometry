@@ -87,14 +87,25 @@ def _get_saelens_catalog(release: str) -> list[str] | None:
     """
     Return list of SAE IDs for `release`, or None if catalog is unavailable.
 
-    Strategy 1: use the official directory API (older SAELens).
-    Strategy 2: probe with a sentinel ID and parse the ValueError (newer SAELens).
+    Strategy 1: read pretrained_saes.yaml directly from the installed package.
+    Strategy 2: use the directory API (older SAELens).
+    Strategy 3: probe with a sentinel ID and parse the truncated ValueError.
     """
-    # Strategy 1 — directory API
+    # Strategy 1 — read the YAML file that ships with every SAELens version
+    try:
+        import sae_lens as _sl
+        yaml_path = os.path.join(os.path.dirname(_sl.__file__), "pretrained_saes.yaml")
+        if os.path.exists(yaml_path):
+            ids = _ids_from_yaml(yaml_path, release)
+            if ids is not None:
+                return ids
+    except Exception:
+        pass
+
+    # Strategy 2 — directory API (older SAELens)
     for import_path in (
         "sae_lens.toolkit.pretrained_saes_directory",
         "sae_lens.pretrained_saes_directory",
-        "sae_lens",
     ):
         try:
             mod = __import__(import_path, fromlist=["get_pretrained_saes_directory"])
@@ -110,24 +121,63 @@ def _get_saelens_catalog(release: str) -> list[str] | None:
         except Exception:
             continue
 
-    # Strategy 2 — parse the error message from a deliberate invalid probe
+    # Strategy 3 — parse the (potentially truncated) ValueError from a probe
     import re
     try:
         from sae_lens import SAE
         SAE.from_pretrained(release=release, sae_id="__probe__")
     except ValueError as e:
         msg = str(e)
-        match = re.search(r"Valid IDs are \[(.+?)\]", msg, re.DOTALL)
-        if match:
-            ids = re.findall(r"'([^']+)'", match.group(1))
-            if ids:
-                return ids
-        ids = re.findall(r"'((?:layer|embedding)_[^']+)'", msg)
+        ids = re.findall(r"'((?:layer|embedding)[^']+)'", msg)
         if ids:
             return ids
     except Exception:
         pass
 
+    return None
+
+
+def _ids_from_yaml(yaml_path: str, release: str) -> list[str] | None:
+    """Parse pretrained_saes.yaml and return IDs for the given release."""
+    try:
+        import yaml
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+    except ImportError:
+        # PyYAML unavailable — minimal line parser
+        data = {}
+        current = None
+        in_saes = False
+        with open(yaml_path) as f:
+            for line in f:
+                s = line.rstrip()
+                if not s or s.startswith("#"):
+                    continue
+                indent = len(s) - len(s.lstrip())
+                c = s.lstrip()
+                if indent == 0 and c.endswith(":"):
+                    current = c[:-1]
+                    data[current] = []
+                    in_saes = False
+                elif indent == 2 and c == "saes:":
+                    in_saes = True
+                elif indent == 2 and c != "saes:":
+                    in_saes = False
+                elif in_saes and c.startswith("- id:"):
+                    if current:
+                        data[current].append(c[len("- id:"):].strip())
+    except Exception:
+        return None
+
+    if release not in data:
+        return None
+
+    entry = data[release]
+    if isinstance(entry, list):
+        return [str(i) for i in entry]
+    elif isinstance(entry, dict):
+        saes = entry.get("saes", [])
+        return [s["id"] for s in saes if isinstance(s, dict) and "id" in s]
     return None
 
 
