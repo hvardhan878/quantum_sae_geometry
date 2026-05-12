@@ -62,22 +62,7 @@ coverage.xml
 .pytype/
 .ruff_cache/
 
-# Experiment outputs
-results/
-checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.bin
 
-# Plots
-*.png
-*.pdf
-*.svg
-!docs/**/*.png
-!docs/**/*.pdf
-!docs/**/*.svg
 
 # HuggingFace / dataset caches
 .cache/
