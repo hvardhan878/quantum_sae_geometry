@@ -177,6 +177,7 @@ def run_dry(results_dir: str) -> bool:
         "geometry.pt",
         "reconstruction_analysis.pt",
         "quantum_vs_fvu.png",
+        "neg_weight_vs_fvu.png",
         "cluster_classifications.png",
     ]
     all_ok = True

@@ -116,45 +116,66 @@ def run_reconstruction_analysis(
     quantum_ness_scores = np.array(
         [g["quantum_ness_score"] for g in aligned_geo], dtype=np.float32
     )
+    # negative_weight_fraction: Levinson barycentric prediction test
+    neg_weight_fracs = np.array(
+        [g.get("negative_weight_fraction", 0.0) for g in aligned_geo], dtype=np.float32
+    )
     classifications = [g["classification"] for g in aligned_geo]
     cluster_ids = [g["cluster_id"] for g in aligned_geo]
 
-    print(f"\n[recon_analysis] Quantum-ness scores: "
-          f"mean={quantum_ness_scores.mean():.4f}, "
-          f"std={quantum_ness_scores.std():.4f}")
-    print(f"[recon_analysis] FVU contributions:  "
-          f"mean={fvu_contributions.mean():.4f}, "
-          f"std={fvu_contributions.std():.4f}")
+    print(f"\n[recon_analysis] Quantum-ness scores:       "
+          f"mean={quantum_ness_scores.mean():.4f}, std={quantum_ness_scores.std():.4f}")
+    print(f"[recon_analysis] Neg-weight fractions:      "
+          f"mean={neg_weight_fracs.mean():.4f}, std={neg_weight_fracs.std():.4f}")
+    print(f"[recon_analysis] FVU contributions:         "
+          f"mean={fvu_contributions.mean():.4f}, std={fvu_contributions.std():.4f}")
 
-    # ---- Spearman correlation ----
-    if len(quantum_ness_scores) < 3:
-        print("[recon_analysis] Too few clusters for correlation test.")
-        spearman_r, spearman_p = float("nan"), float("nan")
-    else:
-        spearman_r, spearman_p = spearmanr(quantum_ness_scores, fvu_contributions)
-        spearman_r = float(spearman_r)
-        spearman_p = float(spearman_p)
+    def _spearman(x, y, label):
+        if len(x) < 3:
+            print(f"[recon_analysis] Too few clusters for {label}.")
+            return float("nan"), float("nan")
+        r, p = spearmanr(x, y)
+        return float(r), float(p)
 
-    print(f"\n{'='*60}")
-    print(f"  Spearman r = {spearman_r:.4f}  (p = {spearman_p:.4e})")
-    print(f"  n_clusters = {len(aligned_clusters)}")
+    spearman_r, spearman_p = _spearman(quantum_ness_scores, fvu_contributions,
+                                        "quantum_ness vs FVU")
+    neg_r,      neg_p      = _spearman(neg_weight_fracs,    fvu_contributions,
+                                        "neg_weight_frac vs FVU")
+
+    sep = "=" * 62
+    print(f"\n{sep}")
+    print(f"  PRIMARY   — quantum_ness_score vs cluster FVU contribution")
+    print(f"  Spearman r = {spearman_r:+.4f}  (p = {spearman_p:.4e})"
+          f"  n = {len(aligned_clusters)}")
     if not np.isnan(spearman_r):
         if spearman_r > 0.4 and spearman_p < 0.05:
             print("  *** HYPOTHESIS SUPPORTED: quantum geometry predicts FVU ***")
         elif spearman_p >= 0.05:
-            print("  Result is not statistically significant (p >= 0.05)")
+            print("  Not statistically significant (p >= 0.05)")
         else:
-            print(f"  Weak or negative correlation (r={spearman_r:.3f})")
-    print(f"{'='*60}\n")
+            print(f"  Weak or negative correlation")
+    print(f"\n  SECONDARY — negative_weight_fraction vs cluster FVU contribution")
+    print(f"  (Levinson barycentric prediction test adapted to this setting)")
+    print(f"  Spearman r = {neg_r:+.4f}  (p = {neg_p:.4e})"
+          f"  n = {len(aligned_clusters)}")
+    if not np.isnan(neg_r):
+        if neg_r > 0.4 and neg_p < 0.05:
+            print("  *** Out-of-simplex activations predict residual FVU ***")
+        elif neg_p >= 0.05:
+            print("  Not statistically significant (p >= 0.05)")
+    print(f"{sep}\n")
 
     results = {
-        "cluster_ids": cluster_ids,
-        "quantum_ness_scores": quantum_ness_scores,
-        "fvu_contributions": fvu_contributions,
-        "classifications": classifications,
-        "spearman_r": spearman_r,
-        "spearman_p": spearman_p,
-        "n_clusters": len(aligned_clusters),
+        "cluster_ids":               cluster_ids,
+        "quantum_ness_scores":       quantum_ness_scores,
+        "negative_weight_fractions": neg_weight_fracs,
+        "fvu_contributions":         fvu_contributions,
+        "classifications":           classifications,
+        "spearman_r":                spearman_r,
+        "spearman_p":                spearman_p,
+        "neg_weight_spearman_r":     neg_r,
+        "neg_weight_spearman_p":     neg_p,
+        "n_clusters":                len(aligned_clusters),
     }
     torch.save(results, save_path)
     print(f"[recon_analysis] Saved results to {save_path}")
@@ -203,7 +224,9 @@ if __name__ == "__main__":
         geo_results.append({
             "cluster_id": i,
             "quantum_ness_score": qs,
-            "min_eigenvalue": float(rng.uniform(-0.2, 0.1)),
+            "negative_weight_fraction": float(rng.uniform(0, 1)),
+            "classical_fvu": float(rng.uniform(0.01, 0.5)),
+            "quantum_fvu": float(rng.uniform(0, 0.3)),
             "classification": "quantum" if qs > 0.3 else "classical",
         })
 
@@ -218,7 +241,8 @@ if __name__ == "__main__":
         results = run_reconstruction_analysis(
             m, clusters, geo_results, activations_fake, results_dir=tmpdir
         )
-        print(f"  Spearman r={results['spearman_r']:.4f}, p={results['spearman_p']:.4e}")
+        print(f"  Spearman r (qness)    ={results['spearman_r']:.4f}, p={results['spearman_p']:.4e}")
+        print(f"  Spearman r (neg_wt)   ={results['neg_weight_spearman_r']:.4f}, p={results['neg_weight_spearman_p']:.4e}")
         print(f"  n_clusters={results['n_clusters']}")
 
     print("[reconstruction_analysis] Smoke test passed.")
