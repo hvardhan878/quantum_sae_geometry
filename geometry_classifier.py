@@ -44,6 +44,9 @@ K_ARCHETYPES = 4
 # Coordinate-descent iterations for simplex fitting
 AA_ITERS = 100
 
+# Module-level counter used to limit debug prints to the first 5 clusters
+_DEBUG_FVU_PRINTS = 0
+
 
 # ---------------------------------------------------------------------------
 # Farthest-point initialisation for archetypes
@@ -199,13 +202,20 @@ def classify_cluster_geometry(
     classical_residual = proj_all - classical_recon
     classical_fvu      = float((classical_residual ** 2).sum()) / (total_var + 1e-8)
 
-    # Trivially-easy clusters have no interesting geometry
-    if classical_fvu < 0.001:
-        return _degenerate_result(cluster, reason="trivially_low_classical_fvu",
-                                  classical_fvu=classical_fvu)
-
     quantum_residual = proj_all - quantum_recon
     quantum_fvu      = float((quantum_residual ** 2).sum()) / (total_var + 1e-8)
+
+    # Debug: show raw FVU numbers for the first few clusters so we can
+    # diagnose what magnitude of geometry we're dealing with.
+    global _DEBUG_FVU_PRINTS
+    if _DEBUG_FVU_PRINTS < 5:
+        print(
+            f"  [debug] cluster {int(cluster['cluster_id']):3d}  "
+            f"total_var={total_var:.6f}  "
+            f"classical_fvu={classical_fvu:.6f}  "
+            f"quantum_fvu={quantum_fvu:.6f}"
+        )
+        _DEBUG_FVU_PRINTS += 1
 
     # Clamp to [0, 1]: the gap cannot be negative (unconstrained ≤ constrained error)
     quantum_ness_score = float(np.clip(
@@ -291,6 +301,10 @@ def classify_all_clusters(
     print(f"[geometry] Classifying {len(clusters)} clusters ...")
     print(f"[geometry] feature_activations shape: {feature_activations.shape}")
     print(f"[geometry] Method: activation-trajectory simplex gap (K={K_ARCHETYPES})")
+
+    # Reset debug-print counter so we see fresh FVU values for the first 5 clusters
+    global _DEBUG_FVU_PRINTS
+    _DEBUG_FVU_PRINTS = 0
 
     results = []
     class_counts = {"classical": 0, "quantum": 0, "ambiguous": 0}
