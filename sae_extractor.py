@@ -236,9 +236,25 @@ def extract_activations(
     dataloader,
     results_dir: str = RESULTS_DIR,
     device: str | None = None,
+    model=None,  # optional pre-loaded HF model — avoids re-downloading when sweeping layers
 ) -> dict:
     """
     Run the full extraction pipeline for one model config.
+
+    Parameters
+    ----------
+    model_cfg : dict
+        Entry from config.MODELS.
+    dataloader : DataLoader
+        Tokenised PopQA prompts.
+    results_dir : str
+        Where to read/write activations.pt.
+    device : str | None
+        Device for the SAE forward pass (model device is wherever it was loaded).
+    model : transformers.PreTrainedModel | None
+        If provided, this pre-loaded model is reused instead of re-loading from
+        HuggingFace. Use this when sweeping multiple layers of the same hf_name
+        (loading Gemma-2-2b ~5GB is the slowest step otherwise).
 
     Returns a dict with keys:
         feature_activations, sae_reconstruction, residual,
@@ -279,18 +295,22 @@ def extract_activations(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[sae_extractor] Using device: {device}")
 
-    # ---- Load LLM ----
-    print(f"[sae_extractor] Loading model {model_cfg['hf_name']} ...")
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    torch_dtype = dtype_map.get(model_cfg["dtype"], torch.bfloat16)
+    # ---- Load LLM (or reuse cached one) ----
+    if model is not None:
+        print(f"[sae_extractor] Reusing pre-loaded model for {model_cfg['hf_name']}")
+        model.eval()
+    else:
+        print(f"[sae_extractor] Loading model {model_cfg['hf_name']} ...")
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        torch_dtype = dtype_map.get(model_cfg["dtype"], torch.bfloat16)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_cfg["hf_name"],
-        torch_dtype=torch_dtype,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_cfg["hf_name"],
+            torch_dtype=torch_dtype,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
 
     # ---- Load SAE ----
     sae_release = model_cfg["sae_release"]
