@@ -199,21 +199,32 @@ def _final_path(model_name: str, results_dir: str) -> str:
     return os.path.join(_get_results_dir(model_name, results_dir), "activations.pt")
 
 
-def _fvu(original: torch.Tensor, reconstruction: torch.Tensor) -> torch.Tensor:
+def _fvu(hidden_states: torch.Tensor, reconstructions: torch.Tensor) -> torch.Tensor:
     """
-    Fraction of Variance Unexplained per sample.
+    Fraction of Variance Unexplained per prompt.
 
-    FVU = ||x - x_hat||^2 / ||x - mean(x)||^2
+    For each prompt we treat its hidden-state vector x as a signal across the
+    d_model channels, centre it by its own per-prompt mean, and ask how much
+    of that variance is unexplained by the SAE reconstruction:
 
-    Returns a 1-D tensor of shape (batch,).
+        residuals  = x - x_hat
+        centered   = x - x.mean(dim=-1, keepdim=True)
+        total_var  = sum(centered**2, dim=-1)
+        FVU        = sum(residuals**2, dim=-1) / (total_var + 1e-8)
+
+    Returns a 1-D tensor of shape (batch,) with values in [0, 1] for a
+    well-trained SAE.
+
+    NOTE: an earlier version centred by the *batch* mean (dim=0) — that gave
+    spurious FVU values in the billions when run on tiny batches because the
+    per-feature batch variance can collapse to ~0 in float32 from a few
+    bfloat16 samples.
     """
-    residual = original - reconstruction
-    var_residual = (residual ** 2).sum(dim=-1)
-    mean_x = original.mean(dim=0, keepdim=True)
-    var_total = ((original - mean_x) ** 2).sum(dim=-1)
-    # Guard against zero-variance inputs
-    var_total = var_total.clamp(min=1e-8)
-    return var_residual / var_total
+    residuals = hidden_states - reconstructions                            # (batch, d_model)
+    centered = hidden_states - hidden_states.mean(dim=-1, keepdim=True)    # (batch, d_model)
+    total_var = (centered ** 2).sum(dim=-1)                                # (batch,)
+    fvu_per_prompt = (residuals ** 2).sum(dim=-1) / (total_var + 1e-8)     # (batch,)
+    return fvu_per_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +350,7 @@ def extract_activations(
             print(f"  recon:          {recon.shape}")
             print(f"  residual:       {residual.shape}")
             print(f"  fvu:            {fvu.shape}")
-            print(f"  fvu mean:       {fvu.mean().item():.4f}")
+            print(f"fvu min: {fvu.min():.4f}, max: {fvu.max():.4f}, mean: {fvu.mean():.4f}")
             first_batch_done = True
 
         all_feat_acts.append(feat_acts.cpu())
