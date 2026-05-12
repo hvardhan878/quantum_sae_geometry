@@ -56,10 +56,20 @@ def build_dataloader(
         saved = torch.load(cache_path, weights_only=True)
         input_ids = saved["input_ids"]
         attention_mask = saved["attention_mask"]
-        print(f"[data_loader] input_ids shape: {input_ids.shape}")
-        print(f"[data_loader] attention_mask shape: {attention_mask.shape}")
-        dataset = TensorDataset(input_ids, attention_mask)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        # Validate that the cache was built with right-padding. If any row's
+        # first attention_mask entry is 0 then it was built with left padding
+        # (under the old buggy data_loader) and must be regenerated.
+        first_col = attention_mask[:, 0]
+        if (first_col == 0).any():
+            print(f"[data_loader] Cache appears to be LEFT-padded "
+                  f"(stale from old data_loader) — regenerating.")
+            os.remove(cache_path)
+        else:
+            print(f"[data_loader] input_ids shape: {input_ids.shape}")
+            print(f"[data_loader] attention_mask shape: {attention_mask.shape}")
+            dataset = TensorDataset(input_ids, attention_mask)
+            return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     questions = load_popqa_prompts(n_prompts=n_prompts)
 
@@ -70,7 +80,13 @@ def build_dataloader(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[data_loader] Tokenizing {len(questions)} prompts (max_length={max_length}) ...")
+    # Force right padding — Gemma-2-it tokenizers default to LEFT padding, which
+    # makes "last token" extraction fragile. With right padding the last real
+    # token is consistently at attention_mask.sum(dim=1) - 1.
+    tokenizer.padding_side = "right"
+
+    print(f"[data_loader] Tokenizing {len(questions)} prompts "
+          f"(max_length={max_length}, padding_side=right) ...")
     encoded = tokenizer(
         list(questions),
         padding="max_length",

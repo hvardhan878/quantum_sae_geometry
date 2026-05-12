@@ -241,12 +241,36 @@ def extract_activations(
     Run the full extraction pipeline for one model config.
 
     Returns a dict with keys:
-        feature_activations, sae_reconstruction, residual, fvu_per_prompt
+        feature_activations, sae_reconstruction, residual,
+        last_hidden, fvu_per_prompt
     """
     final_path = _final_path(model_cfg["name"], results_dir)
     if os.path.exists(final_path):
-        print(f"[sae_extractor] Final activations already exist at {final_path}, loading.")
-        return torch.load(final_path, weights_only=False)
+        existing = torch.load(final_path, weights_only=False)
+
+        # Detect a stale activations file from before the last_hidden + token-
+        # position fixes. If `last_hidden` is missing or has near-zero
+        # cross-prompt variance, force re-extraction.
+        stale = False
+        if "last_hidden" not in existing:
+            print(f"[sae_extractor] Existing {final_path} has no 'last_hidden' — re-extracting.")
+            stale = True
+        else:
+            lh = existing["last_hidden"]
+            lh_var = lh.float().var(dim=0).mean().item()
+            if lh_var < 1e-4:
+                print(f"[sae_extractor] Existing {final_path} has degenerate "
+                      f"last_hidden variance ({lh_var:.2e}) — re-extracting.")
+                stale = True
+
+        if not stale:
+            print(f"[sae_extractor] Final activations already exist at {final_path}, loading.")
+            return existing
+
+        # Move stale file aside so we can re-extract
+        backup = final_path + ".stale.bak"
+        os.rename(final_path, backup)
+        print(f"[sae_extractor] Moved stale file to {backup}")
 
     from transformers import AutoModelForCausalLM
     from sae_lens import SAE
@@ -327,12 +351,40 @@ def extract_activations(
         # hidden: (batch, seq_len, d_model) — take last non-pad token
         hidden = _hook_storage["hidden"]  # (batch, seq_len, d_model)
 
-        # Find last non-padding token index per sample
-        seq_lengths = attention_mask.sum(dim=1) - 1  # (batch,)
-        last_hidden = hidden[
-            torch.arange(hidden.size(0), device=device), seq_lengths
-        ]  # (batch, d_model)
+        # Find the last *real* (non-padding) token position per sample.
+        #
+        # CRITICAL: this must be robust to both left- AND right-padding.
+        # Gemma-2 chat-tuned tokenizers often default to LEFT padding, in which
+        # case `attention_mask.sum(dim=1) - 1` incorrectly points to the FIRST
+        # real token (right after the padding) — every prompt then yields a
+        # near-identical hidden state ("What is the…", "Who is…", etc.)
+        # and total variance across prompts collapses to ~0.
+        #
+        # The robust formula multiplies attention_mask by position indices then
+        # takes argmax — this returns the largest index where attention_mask == 1
+        # regardless of padding side:
+        #   right pad  attn=[1,1,1,1,0,0,0]  pos*attn=[0,1,2,3,0,0,0]  argmax=3 ✓
+        #   left  pad  attn=[0,0,0,1,1,1,1]  pos*attn=[0,0,0,3,4,5,6]  argmax=6 ✓
+        seq_len = attention_mask.shape[1]
+        pos = torch.arange(seq_len, device=device).unsqueeze(0)            # (1, seq_len)
+        last_token_pos = (attention_mask * pos).argmax(dim=1)              # (batch,)
+
+        # Extract hidden state at the correct position for each prompt
+        last_hidden = torch.stack([
+            hidden[i, last_token_pos[i], :]
+            for i in range(hidden.shape[0])
+        ])  # (batch, d_model)
         last_hidden_f32 = last_hidden.float()
+
+        if not first_batch_done:
+            # Variance sanity check — should be non-trivially > 0
+            lh_var = last_hidden_f32.var(dim=0).mean().item()
+            print(f"[sae_extractor] last_hidden cross-prompt variance: {lh_var:.6f}")
+            print(f"[sae_extractor] last_token_pos sample: {last_token_pos[:8].tolist()}")
+            if lh_var < 1e-4:
+                print(f"[sae_extractor] WARNING: variance is near zero — "
+                      f"hidden states may be identical across prompts. "
+                      f"Check tokenizer padding side.")
 
         # ---- SAE forward (use encode/decode for stable API across SAELens versions) ----
         with torch.no_grad():
