@@ -84,7 +84,13 @@ def _resolve_sae_id(release: str, configured_id: str, target_layer: int) -> str:
 
 
 def _get_saelens_catalog(release: str) -> list[str] | None:
-    """Return list of SAE IDs for `release`, or None if catalog is unavailable."""
+    """
+    Return list of SAE IDs for `release`, or None if catalog is unavailable.
+
+    Strategy 1: use the official directory API (older SAELens).
+    Strategy 2: probe with a sentinel ID and parse the ValueError (newer SAELens).
+    """
+    # Strategy 1 — directory API
     for import_path in (
         "sae_lens.toolkit.pretrained_saes_directory",
         "sae_lens.pretrained_saes_directory",
@@ -103,6 +109,25 @@ def _get_saelens_catalog(release: str) -> list[str] | None:
             return list(saes_map.keys())
         except Exception:
             continue
+
+    # Strategy 2 — parse the error message from a deliberate invalid probe
+    import re
+    try:
+        from sae_lens import SAE
+        SAE.from_pretrained(release=release, sae_id="__probe__")
+    except ValueError as e:
+        msg = str(e)
+        match = re.search(r"Valid IDs are \[(.+?)\]", msg, re.DOTALL)
+        if match:
+            ids = re.findall(r"'([^']+)'", match.group(1))
+            if ids:
+                return ids
+        ids = re.findall(r"'((?:layer|embedding)_[^']+)'", msg)
+        if ids:
+            return ids
+    except Exception:
+        pass
+
     return None
 
 
