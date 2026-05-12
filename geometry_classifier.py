@@ -297,33 +297,43 @@ def classify_cluster_geometry(
     # ---- Classical vs quantum test via barycentric coordinates ----
     #
     # Classical probability theory: any mixed state is a convex combination of
-    # pure states (archetypes). Barycentric coords must all be ≥ 0.
+    # pure states (archetypes). Barycentric coords must all be ≥ 0, and a point
+    # is fully inside the simplex iff every coord is non-negative.
     #
-    # Quantum theory: states outside the classical simplex are allowed because
-    # the geometry of quantum state space is not a simplex — it is a convex body
-    # with curved boundaries (e.g. Bloch sphere). Points outside the simplex
-    # → at least one negative barycentric coordinate.
+    # Quantum theory allows states outside the classical simplex — the geometry
+    # of quantum state space has curved boundaries (e.g. Bloch sphere), not flat
+    # simplex faces. Points outside the simplex have at least one negative coord.
     #
-    # We therefore count the fraction of prompts with *any* negative coordinate
-    # as our "quantum-ness" proxy.
+    # We compute a *continuous* quantum-ness score (rather than a binary flag) by
+    # measuring how far each activation sits outside the simplex:
+    #
+    #   violation_i = sum of |negative coords| for activation i
+    #                 ----------------------------------------
+    #                 sum of |all coords| + 1e-8
+    #
+    # This is 0 when the point is perfectly inside the simplex (all coords ≥ 0),
+    # and approaches 1 when the point is almost entirely outside (large negative
+    # coords dominate the sum). Averaging over all active prompts gives a score
+    # in [0, 1]: 0 = perfectly classical, 1 = maximally quantum.
     coords = _barycentric_coords(projected_active, archetypes)
-    # coords: (n_active, K) — values can be negative
+    # coords: (n_active, K) — can be negative for out-of-simplex points
 
-    has_negative = (coords < 0).any(axis=1)             # (n_active,) bool
-    quantum_ness_score = float(has_negative.mean())
+    neg_mass = np.abs(np.minimum(coords, 0)).sum(axis=1)   # (n_active,) sum of |negative coords|
+    total_mass = np.abs(coords).sum(axis=1)                # (n_active,) sum of |all coords|
+    per_activation_violation = neg_mass / (total_mass + 1e-8)  # (n_active,) in [0, 1]
+    quantum_ness_score = float(per_activation_violation.mean())
 
     # ---- Density-matrix eigenvalue test ----
     #
     # Normalise the empirical covariance to unit trace and check its minimum
     # eigenvalue. A classical covariance is always PSD (all eigenvalues ≥ 0).
-    # Significant negative eigenvalues in the normalised version suggest the
-    # activations live on a curved (quantum) rather than flat (classical) manifold.
+    # Significant negative eigenvalues suggest a curved (quantum) manifold.
     min_eig = _density_matrix_min_eigenvalue(projected_active)
 
     # ---- Classification decision ----
-    if quantum_ness_score < 0.10 and min_eig > -0.05:
+    if quantum_ness_score < 0.15:
         classification = "classical"
-    elif quantum_ness_score > 0.30 or min_eig < -0.10:
+    elif quantum_ness_score >= 0.40:
         classification = "quantum"
     else:
         classification = "ambiguous"
