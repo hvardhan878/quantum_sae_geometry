@@ -34,7 +34,7 @@ from config import (
 )
 
 # Maximum subspace dimension per cluster (kept small for geometry computations)
-SUBSPACE_DIM = 10
+SUBSPACE_DIM = 25
 # K-subspace iteration count
 MAX_ITER = 20
 
