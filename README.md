@@ -59,6 +59,7 @@ PopQA prompts
 | `visualize.py` | Scatter plot (quantum-ness vs FVU) and bar chart of classifications. |
 | `run_experiment.py` | End-to-end runner over `get_active_models()`. |
 | `dry_run.py` | Synthetic-data end-to-end sanity check (no network/GPU, ~3 sec). |
+| `preflight.py` | Validates GPU, HF auth, model & dataset access before a real run. |
 
 ## Installation
 
@@ -72,6 +73,65 @@ For HuggingFace models you need an access token:
 huggingface-cli login
 # Gemma access requires accepting the license at huggingface.co/google/gemma-2-2b-it
 ```
+
+## Running on Paperspace (or any GPU cloud)
+
+1. **Spin up an instance** with at least 16 GB GPU memory (e.g. A4000 / RTX5000 /
+   A6000 / A100). Gemma-2-2b in bfloat16 needs ~5 GB plus inference overhead;
+   the SAE adds ~1 GB.
+
+2. **Clone and install:**
+
+   ```bash
+   git clone <your-repo-url>
+   cd quantum_sae_geometry
+   pip install -r requirements.txt
+   ```
+
+3. **Authenticate with HuggingFace** (Gemma is a gated model — accept the
+   license at https://huggingface.co/google/gemma-2-2b-it first):
+
+   ```bash
+   export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxx
+   # or
+   huggingface-cli login
+   ```
+
+4. **Run the preflight check** — this validates GPU, auth, model access,
+   dataset, and disk space in under a minute:
+
+   ```bash
+   python preflight.py
+   ```
+
+   Fix every `[FAIL]` line before proceeding. Warnings are non-fatal.
+
+5. **Quick sanity check** with synthetic data (no network/GPU):
+
+   ```bash
+   python dry_run.py
+   ```
+
+6. **Tiny real run** to confirm the live pipeline works (~5 min on a modern GPU):
+
+   ```bash
+   python run_experiment.py --n_prompts 10 --n_clusters 8
+   ```
+
+7. **Full experiment** (~30–90 min on a single A100, depending on instance):
+
+   ```bash
+   # Recommended: run inside tmux/screen so disconnects don't kill it
+   tmux new -s qbg
+   python run_experiment.py 2>&1 | tee run.log
+   # Ctrl+B then D to detach;  `tmux attach -t qbg` to reconnect
+   ```
+
+   If the run crashes during SAE extraction it will resume from the last
+   checkpoint (saved every `CHECKPOINT_EVERY=10` batches).
+
+8. **Download results** — everything you need is under `results/{model_name}/`,
+   especially `quantum_vs_fvu.png` and `reconstruction_analysis.pt`.
 
 ## Sanity checks (run these first)
 

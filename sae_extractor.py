@@ -110,7 +110,9 @@ def extract_activations(
     )
     sae = sae.to(device)
     sae.eval()
-    print(f"[sae_extractor] SAE loaded. d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
+    # Probe the SAE's expected input dtype by looking at its decoder weight
+    sae_dtype = sae.W_dec.dtype
+    print(f"[sae_extractor] SAE loaded. d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}, dtype={sae_dtype}")
 
     # ---- Hook setup ----
     target_layer = model_cfg["target_layer"]
@@ -165,19 +167,13 @@ def extract_activations(
         ]  # (batch, d_model)
         last_hidden_f32 = last_hidden.float()
 
-        # ---- SAE forward ----
+        # ---- SAE forward (use encode/decode for stable API across SAELens versions) ----
         with torch.no_grad():
-            sae_out = sae(last_hidden.to(sae.dtype if hasattr(sae, "dtype") else torch.float32))
-
-        # SAELens SAE.forward returns an SAEOutput namedtuple-like object
-        # with fields: feature_acts, sae_out (reconstruction)
-        if hasattr(sae_out, "feature_acts"):
-            feat_acts = sae_out.feature_acts.float()       # (batch, n_features)
-            recon = sae_out.sae_out.float()                # (batch, d_model)
-        else:
-            # Fallback: tuple output (feature_acts, reconstruction)
-            feat_acts = sae_out[0].float()
-            recon = sae_out[1].float()
+            sae_input = last_hidden.to(sae_dtype)
+            feat_acts = sae.encode(sae_input)              # (batch, n_features)
+            recon = sae.decode(feat_acts)                  # (batch, d_model)
+        feat_acts = feat_acts.float()
+        recon = recon.float()
 
         residual = last_hidden_f32 - recon                 # (batch, d_model)
         fvu = _fvu(last_hidden_f32, recon)                 # (batch,)
