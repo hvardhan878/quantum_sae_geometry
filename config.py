@@ -88,7 +88,7 @@ MODELS = [
         "sae_id": "layer_0/width_16k/average_l0_71",
         "target_layer": 0,
         "dtype": "bfloat16",
-        "active": False,
+        "active": True,
     },
     {
         "name": "llama-3.1-8b-layer-31",
@@ -97,7 +97,7 @@ MODELS = [
         "sae_id": "layer_31/width_16k/average_l0_71",
         "target_layer": 31,
         "dtype": "bfloat16",
-        "active": False,
+        "active": True,
     },
 ]
 
